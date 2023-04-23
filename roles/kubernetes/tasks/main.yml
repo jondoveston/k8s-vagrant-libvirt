@@ -1,0 +1,417 @@
+---
+- name: swap off
+  command: swapoff -a
+
+- name: swap off
+  lineinfile:
+    path: /etc/fstab
+    state: absent
+    regexp: 'swap'
+  notify: reboot
+
+- name: set sysctl
+  sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_set: yes
+    state: present
+    reload: yes
+  with_items:
+  - {key: net.ipv4.ip_forward, value: 1}
+  # - {key: net.ipv6.conf.all.forwarding, value: 1}
+  # - {key: net.bridge.bridge-nf-call-ip6tables, value: 1}
+  # - {key: net.bridge.bridge-nf-call-iptables, value: 1}
+  # - {key: net.netfilter.nf_conntrack_max, value: 524288}
+  # - {key: net.bridge.bridge-nf-call-arptables, value: 1}
+  # - {key: kernel.keys.root_maxbytes, value: 25000000}
+  # - {key: kernel.keys.root_maxkeys, value: 1000000}
+  # - {key: kernel.panic, value: 10}
+  # - {key: kernel.panic_on_oops, value: 1}
+  # - {key: net.ipv4.conf.all.forwarding, value: 1}
+  # - {key: net.ipv4.conf.all.route_localnet, value: 1}
+  # - {key: net.ipv4.conf.default.forwarding, value: 1}
+  # - {key: net.ipv6.conf.default.forwarding, value: 1}
+  # - {key: net.netfilter.nf_conntrack_tcp_timeout_close_wait, value: 3600}
+  # - {key: net.netfilter.nf_conntrack_tcp_timeout_established, value: 86400}
+  # - {key: vm.overcommit_memory, value: 1}
+  # - {key: vm.panic_on_oom, value: 0}
+  notify: reboot
+
+- name: add the modules
+  modprobe:
+    name: "{{ item }}"
+    state: present
+  notify: reboot
+  loop:
+  - br_netfilter
+  - overlay
+
+- name: persist modules
+  blockinfile:
+    create: yes
+    path: /etc/modules-load.d/containerd.conf
+    block: |
+      br_netfilter
+      overlay
+    mode: 0600
+  notify: reboot
+
+- name: flush handlers
+  meta: flush_handlers
+
+- name: preserve old containerd conf
+  command: mv /etc/containerd/config.toml /etc/containerd/config.orig.toml
+  args:
+    creates: /etc/containerd/config.orig.toml
+
+- name: generate containerd conf
+  shell: containerd config default > /etc/containerd/config.toml
+  args:
+    creates: /etc/containerd/config.toml
+  notify: restart containerd
+
+- name: replace cgroup
+  replace:
+    path: /etc/containerd/config.toml
+    regexp: 'SystemdCgroup\s*=\s*false'
+    replace: "SystemdCgroup = true"
+    backup: yes
+  notify: restart containerd
+
+- name: persist modules
+  blockinfile:
+    create: yes
+    path: /etc/profile.d/crictl.sh
+    block: |
+      export CONTAINER_RUNTIME_ENDPOINT=unix:///var/run/containerd/containerd.sock
+
+- name: flush handlers
+  meta: flush_handlers
+
+- name: dependencies
+  apt:
+    name: "{{ item }}"
+    state: "{{ state }}"
+  loop:
+  - curl
+  - gnupg2
+  - apt-transport-https
+  - ca-certificates
+  - software-properties-common
+
+- name: k8s key
+  apt_key:
+    url: "https://packages.cloud.google.com/apt/doc/apt-key.gpg"
+    keyring: "/etc/apt/trusted.gpg.d/packages-cloud-google-com.gpg"
+    state: present
+
+- name: k8s repo
+  apt_repository:
+    repo: "deb [signed-by=/etc/apt/trusted.gpg.d/packages-cloud-google-com.gpg] https://apt.kubernetes.io/ kubernetes-xenial main"
+    state: present
+
+- name: install k8s
+  apt:
+    name: "{{ item }}"
+  with_items:
+    - kubelet
+    - kubeadm
+    - kubectl
+
+- name: generate kubeadm config
+  shell: kubeadm config print init-defaults --component-configs KubeletConfiguration,KubeProxyConfiguration > /etc/kubernetes/kubeadm-config.yaml
+  args:
+    creates: /etc/kubernetes/kubeadm-config.yaml
+  when: inventory_hostname_short == "px0"
+
+- name: replace cgroup
+  replace:
+    path: /etc/kubernetes/kubeadm-config.yaml
+    regexp: '^cgroupDriver:.*$'
+    replace: "cgroupDriver: systemd"
+  when: inventory_hostname_short == "px0"
+
+- name: add pod network for flannel
+  lineinfile:
+    path: /etc/kubernetes/kubeadm-config.yaml
+    regexp: 'podSubnet:'
+    line: '  podSubnet: 10.244.0.0/16'
+    insertafter: '^networking:'
+  when: inventory_hostname_short == "px0"
+
+- name: replace address
+  replace:
+    path: /etc/kubernetes/kubeadm-config.yaml
+    regexp: '^  advertiseAddress:.*$'
+    replace: "  advertiseAddress: {{ hostvars[inventory_hostname]['ansible_eth1']['ipv4']['address'] }}"
+  when: inventory_hostname_short == "px0"
+
+- name: replace name
+  replace:
+    path: /etc/kubernetes/kubeadm-config.yaml
+    regexp: '^  name:.*$'
+    replace: "  name: {{ inventory_hostname_short }}"
+  when: inventory_hostname_short == "px0"
+
+- name: kubeadm init
+  shell: "kubeadm init --config /etc/kubernetes/kubeadm-config.yaml > /etc/kubernetes/init.log"
+  args:
+    creates: /etc/kubernetes/admin.conf
+  when: inventory_hostname_short == "px0"
+
+- name: join.sh
+  shell: "cat /etc/kubernetes/init.log | grep -A 1 'kubeadm join' > /etc/kubernetes/join.sh"
+  args:
+    creates: /etc/kubernetes/join.sh
+  when: inventory_hostname_short == "px0"
+
+- name: kube.sh
+  shell: "cat /etc/kubernetes/init.log | grep 'export KUBECONFIG' > /etc/profile.d/kube.sh"
+  args:
+    creates: /etc/profile.d/kube.sh
+  when: inventory_hostname_short == "px0"
+
+- name: fetch join script
+  fetch:
+    src: /etc/kubernetes/join.sh
+    dest: /tmp/
+    flat: yes
+  when: inventory_hostname_short == "px0"
+
+- name: allow pods on the master
+  command: kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  ignore_errors: yes
+  when: inventory_hostname_short == "px0"
+
+- name: allow pods on the master
+  command: kubectl taint nodes --all node-role.kubernetes.io/master-
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  ignore_errors: yes
+  when: inventory_hostname_short == "px0"
+
+- name: label the workers for no good reason
+  command: kubectl label nodes --all node-role.kubernetes.io/worker=
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  ignore_errors: yes
+  when: inventory_hostname_short == "px0"
+
+- name: fetch admin
+  fetch:
+    src: /etc/kubernetes/admin.conf
+    dest: admin.conf
+    flat: yes
+  when: inventory_hostname_short == "px0"
+
+# - name: kube network calico
+#   command: kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/tigera-operator.yaml
+#   environment:
+#     KUBECONFIG: /etc/kubernetes/admin.conf
+#   when: inventory_hostname_short == "px0"
+
+# - name: kube network calico
+#   command: kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/custom-resources.yaml
+#   environment:
+#     KUBECONFIG: /etc/kubernetes/admin.conf
+#   when: inventory_hostname_short == "px0"
+
+- name: kube network flannel
+  command: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  when: inventory_hostname_short == "px0"
+
+- name: copy the join script
+  copy:
+    src: /tmp/join.sh
+    dest: /etc/kubernetes/join.sh
+    mode: 0755
+  when: inventory_hostname_short != "px0"
+
+- name: copy the admin
+  copy:
+    src: admin.conf
+    dest: /etc/kubernetes/admin.conf
+  when: inventory_hostname_short != "px0"
+
+- name: kubeadm join
+  shell: "./join.sh > join.log"
+  args:
+    creates: /etc/kubernetes/join.log
+    chdir: /etc/kubernetes
+  when: inventory_hostname_short != "px0"
+
+- name: install for helm
+  pip:
+    name:
+    - pyyaml
+    - kubernetes
+  when: inventory_hostname_short == "px0"
+
+- name: add dashboard repo
+  kubernetes.core.helm_repository:
+    name: kubernetes-dashboard
+    repo_url: https://kubernetes.github.io/dashboard/
+  when: inventory_hostname_short == "px0"
+
+- name: deploy dashboard
+  kubernetes.core.helm:
+    name: kubernetes-dashboard
+    chart_ref: kubernetes-dashboard/kubernetes-dashboard
+    release_namespace: kubernetes-dashboard
+    create_namespace: yes
+    values:
+      protocolHttp: true
+      service:
+        externalPort: 80
+      ingress:
+        enabled: true
+        hosts: ["dashboard.lan"]
+      extraArgs:
+      - --enable-skip-login
+      - --enable-insecure-login
+      - --system-banner="Welcome to Kubernetes"
+      rbac:
+        clusterReadOnlyRole: true
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  when: inventory_hostname_short == "px0"
+
+- name: add treafik repo
+  kubernetes.core.helm_repository:
+    name: traefik
+    repo_url: https://traefik.github.io/charts
+  when: inventory_hostname_short == "px0"
+
+- name: deploy traefik
+  kubernetes.core.helm:
+    name: traefik
+    chart_ref: traefik/traefik
+    release_namespace: traefik
+    create_namespace: yes
+    values:
+      service:
+        type: NodePort
+      logs:
+        general:
+          # Alternative logging levels are DEBUG, PANIC, FATAL, ERROR, WARN, and INFO.
+          level: ERROR
+        access:
+          enabled: true
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  when: inventory_hostname_short == "px0"
+
+# - name: replace cgroup
+#   replace:
+#     path: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+#     regexp: "cgroup-driver=systemd"
+#     replace: "cgroup-driver={{ cgroup.stdout }}"
+#     backup: yes
+
+# - name: restart k8s
+#   systemd:
+#     name: kubelet
+#     state: restarted
+#     daemon_reload: yes
+
+# # - name: pass bridged ipv4 traffic to iptables
+# #   command: "sysctl net.bridge.bridge-nf-call-iptables=1"
+# #   when: inventory_hostname == 'master'
+
+# # - name: generate password
+# #   shell: mkpasswd --method=SHA-512 password
+# #   register: user_password
+
+# # - name: create user
+# #   user:
+# #     name: kube
+# #     shell: /bin/bash
+# #     groups: docker,sudo
+# #     password: ${user_password.stdout}
+# #     createhome: yes
+# #     append: yes
+
+# # - name: ssh
+# #   authorized_key:
+# #     user: kube
+# #     key: https://github.com/{{github}}.keys
+
+# # - name: kubernetes dir
+# #   file:
+# #     path: /etc/kubernetes
+# #     state: directory
+# #     owner: root
+# #     group: root
+# #     mode: 0775
+
+# # - name: kube dir
+# #   file:
+# #     path: /root/.kube
+# #     state: directory
+# #     owner: root
+# #     group: root
+# #     mode: 0775
+# #   when: inventory_hostname == 'master'
+
+# # - name: copy config
+# #   copy:
+# #     src: /etc/kubernetes/admin.conf
+# #     dest: /root/.kube/config
+# #     remote_src: yes
+# #     owner: root
+# #     group: root
+# #     mode: 0644
+# #   when: inventory_hostname == 'master'
+
+# # - name: set the insecure api port
+# #   replace:
+# #     path: /etc/kubernetes/manifests/kube-apiserver.yaml
+# #     regexp: '--insecure-port=\d*'
+# #     replace: '--insecure-port=8080'
+# #   when: inventory_hostname == 'master'
+
+# # - name: restart k8s
+# #   systemd:
+# #     name: kubelet
+# #     state: restarted
+# #     daemon_reload: yes
+
+# # - name: fix node-ip to private address
+# #   lineinfile:
+# #     path: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+# #     regexp: '^Environment="KUBELET_EXTRA_ARGS'
+# #     insertbefore: '^ExecStart'
+# #     line: "Environment=\"KUBELET_EXTRA_ARGS=--node-ip={{ hostvars[inventory_hostname]['ansible_eth1']['ipv4']['address'] }}\""
+
+# # - name: restart k8s
+# #   systemd:
+# #     name: kubelet
+# #     state: restarted
+# #     daemon_reload: yes
+
+# # - name: fetch admin config
+# #   fetch:
+# #     src: /etc/kubernetes/admin.conf
+# #     dest: admin-{{ inventory_hostname }}.conf
+# #     flat: yes
+# #   when: inventory_hostname == 'master'
+
+# # # - name: template configs
+# # #   template:
+# # #     src: "{{ item }}.yml.j2"
+# # #     dest: "/etc/kubernetes/{{ item }}.yml"
+# # #   when: inventory_hostname == 'master'
+# # #   with_items:
+# # #     - admin
+# # #     - tiller
+
+# # # - name: apply configs
+# # #   command: kubectl apply -f /etc/kubernetes/{{ item }}.yml
+# # #   when: inventory_hostname == 'master'
+# # #   with_items:
+# # #     - admin
+# # #     - tiller

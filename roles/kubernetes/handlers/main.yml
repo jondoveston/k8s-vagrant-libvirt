@@ -1,0 +1,21 @@
+---
+- name: restart smbd
+  systemd:
+    name: smbd
+    state: restarted
+
+- name: restart etcd
+  systemd:
+    name: etcd
+    state: restarted
+
+- name: restart containerd
+  systemd:
+    name: containerd
+    state: restarted
+
+- name: reload firewall
+  command: firewall-cmd --reload
+
+- name: reboot
+  reboot:

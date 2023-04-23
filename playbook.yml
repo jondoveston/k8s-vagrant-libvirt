@@ -1,0 +1,11 @@
+---
+- hosts: all
+  become: yes
+  roles:
+  - { role: repos }
+  - { role: common }
+  - { role: git }
+  - { role: docker }
+  - { role: python }
+  - { role: helm }
+  - { role: kubernetes }
